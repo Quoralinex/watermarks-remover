@@ -1,0 +1,29 @@
+{
+  "repository": "Quoralinex/watermarks-remover",
+  "enabled": true,
+  "plugin": "q1x-delivery",
+  "profile": "delivery",
+  "defaultBranch": "main",
+  "license": "MIT",
+  "skills": [
+    "repository-delivery",
+    "testing",
+    "security-validation",
+    "release-validation"
+  ],
+  "requiredCapabilities": [
+    "github"
+  ],
+  "optionalCapabilities": [
+    "goose-review",
+    "remote-machine",
+    "systematic-debugging",
+    "test-driven-development"
+  ],
+  "permissions": {
+    "read": true,
+    "write": true,
+    "merge": "repository-policy"
+  },
+  "pluginVersion": "0.2.0"
+}

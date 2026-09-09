@@ -8,6 +8,12 @@
 !/hooks/**
 !/.github/
 !/.github/**
+!/.q1x-agent/
+!/.q1x-agent/**
+!/plugins/
+/plugins/*
+!/plugins/q1x-delivery/
+!/plugins/q1x-delivery/**
 !/benchmarks/
 !/benchmarks/**
 !/docs/
