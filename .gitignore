@@ -16,6 +16,8 @@
 !/plugins/q1x-delivery/**
 !/benchmarks/
 !/benchmarks/**
+!/config/
+!/config/**
 !/docs/
 !/docs/**
 !/service/

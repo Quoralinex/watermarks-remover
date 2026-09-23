@@ -171,6 +171,25 @@ def test_html_jsonld_clean_keeps_plain_jsonld_and_regular_scripts():
     assert not any("json-ld" in a for a in actions)
 
 
+@pytest.mark.parametrize("tag", ["script", "SCRIPT", "ScRiPt"])
+def test_html_jsonld_unicode_offsets_preserve_body_and_other_scripts(tag):
+    prefix = "<p>İstanbul</p>"
+    middle = '<script>const city = "İzmir";</script>'
+    suffix = '<script type="application/ld+json">{"name":"İstanbul"}</script>'
+    ai = (
+        f'<{tag} type="application/ld+json">'
+        '{"digitalSourceType":"trainedAlgorithmicMedia"}'
+        f"</{tag}>"
+    )
+    html = prefix + ai + middle + ai + suffix
+    assert inspect_html(html)[1] is True
+    cleaned, actions = clean_html(html)
+    assert cleaned == prefix + middle + suffix
+    assert actions.count("drop json-ld provenance-like script") == 2
+    assert inspect_html(cleaned)[1] is False
+    assert clean_html(cleaned)[0] == cleaned
+
+
 def test_html_jsonld_form_feed_is_whitespace():
     # HTML treats form feed (\f) as whitespace, so it must separate the tag name
     # from the type attribute rather than being consumed into the tag name.
@@ -366,6 +385,78 @@ def test_docx_dropped_customxml_prunes_dangling_relationships():
         assert 'TargetMode="External"' in rels
     assert _dangling_rels(cleaned) == []
     assert any("prune dangling relationships" in a for a in actions)
+
+
+def test_docx_thumbnail_binary_member_preserved():
+    """docProps/thumbnail.jpeg must stay byte-safe: decoding it as UTF-8 text and
+    re-encoding corrupts a binary member into U+FFFD replacement bytes (#312)."""
+    jpeg = bytes.fromhex("FFD8FFE0") + b"\x00\x10JFIF\x00" + b"\xde\xad\xbe\xef" * 64
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t>'
+                "</w:r></w:p></w:body></w:document>"
+            ),
+        )
+        zf.writestr(
+            "docProps/core.xml",
+            (
+                "<cp:coreProperties xmlns:cp='http://schemas.openxmlformats.org/package/"
+                "2006/metadata/core-properties' xmlns:dc='http://purl.org/dc/elements/"
+                "1.1/'><dc:creator>Bot</dc:creator></cp:coreProperties>"
+            ),
+        )
+        zf.writestr("docProps/thumbnail.jpeg", jpeg)
+
+    cleaned, _actions = clean_docx(buf.getvalue())
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        out = zf.read("docProps/thumbnail.jpeg")
+        core = zf.read("docProps/core.xml").decode("utf-8")
+    assert out == jpeg
+    assert out.startswith(b"\xff\xd8\xff\xe0")
+    assert b"\xef\xbf\xbd" not in out
+    # XML provenance scrubbing on the same tree still works
+    assert "Bot" not in core
+
+
+def test_docx_inspect_reports_body_layer_a_carriers(tmp_path: Path):
+    """/inspect must report the Layer A carriers /clean removes from the visible
+    body text runs (word/*.xml), not only provenance/media parts (#312)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello\u200bWorld</w:t>'
+                "</w:r></w:p></w:body></w:document>"
+            ),
+        )
+        zf.writestr(
+            "word/footer1.xml",
+            (
+                '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+                '2006/main"><w:p><w:r><w:t>Foot\u200bnote</w:t></w:r></w:p></w:ftr>'
+            ),
+        )
+
+    path = tmp_path / "doc.docx"
+    path.write_bytes(buf.getvalue())
+
+    rep = inspect_container(path)
+    assert rep.layer_a_total == 2
+    assert rep.layer_a_hits
+    assert any("word/document.xml" in f for f in rep.findings)
+    assert any("word/footer1.xml" in f for f in rep.findings)
+
+    out = tmp_path / "doc_clean.docx"
+    clean_container(path, out)
+    after = inspect_container(out)
+    assert after.layer_a_total == 0
+    assert after.layer_a_hits == []
 
 
 def _make_docx_with_body_text(body_text: str = "Claude wrote this.") -> bytes:
@@ -879,6 +970,57 @@ def test_zip_budget_rejection_propagates_from_inspect(monkeypatch):
         inspect_docx(buf.getvalue())
 
 
+def test_inspect_container_shares_zip_budget_across_scans(monkeypatch):
+    # The body Layer-A scan must share the format inspector's decompression
+    # budget, so an archive of ~half-cap metadata + ~half-cap body XML cannot
+    # decompress both past the processing cap (#312 review).
+    import container_meta
+
+    def make_docx(member_len: int) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("docProps/core.xml", b" " * member_len)
+            zf.writestr("word/document.xml", b"<w:document>" + b" " * member_len + b"</w:document>")
+        return buf.getvalue()
+
+    cap = 1000
+    member = 600  # each member fits under the cap; the two together do not
+    assert member < cap and 2 * member > cap
+    monkeypatch.setattr(container_meta, "MAX_ZIP_DECOMPRESSED_BYTES", cap)
+    with pytest.raises(container_meta.ZipBudgetExceeded):
+        inspect_container(Path("x.docx"), data=make_docx(member))
+    # A single small member stays under the cumulative cap.
+    rep = inspect_container(Path("x.docx"), data=make_docx(100))
+    assert rep.layer_a_total == 0
+
+
+def test_inspect_odt_content_xml_not_rejected_at_budget_boundary(monkeypatch):
+    # ODT content.xml is the visible body. Its bytes must not be charged to the
+    # shared budget by both inspect_odt and the body Layer-A scan, or a
+    # content.xml just under the cap is falsely rejected with ZipBudgetExceeded
+    # (#312 review).
+    import container_meta
+
+    def make_odt(content_len: int) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+            zf.writestr("meta.xml", "<office:document-meta/>")
+            zf.writestr("META-INF/manifest.xml", "<manifest:manifest/>")
+            zf.writestr(
+                "content.xml",
+                b"<office:document-content>" + b" " * content_len + b"</office:document-content>",
+            )
+        return buf.getvalue()
+
+    cap = 1000
+    content = 600  # fits under the cap once; would exceed it if charged twice
+    assert content < cap and 2 * content > cap
+    monkeypatch.setattr(container_meta, "MAX_ZIP_DECOMPRESSED_BYTES", cap)
+    rep = inspect_container(Path("x.odt"), data=make_odt(content))
+    assert rep.format == "odt"
+
+
 def test_zip_budget_rejection_propagates_from_detect_container_format_mimetype(monkeypatch):
     import container_meta
 
@@ -940,3 +1082,98 @@ def test_docx_clean_preserves_ooxml_appversion_schema_validity():
         assert "<AppVersion>16.0000</AppVersion>" in app
         assert "<Company></Company>" in app or "<Company/>" in app
         assert "<Manager></Manager>" in app or "<Manager/>" in app
+
+
+# ---------------------------------------------------------------------------
+# HTML / Markdown provenance comments
+# ---------------------------------------------------------------------------
+
+
+def test_html_ai_provenance_comment_detected_and_cleaned():
+    html = (
+        "<html><body><!-- generated by ChatGPT --><p>Hi</p>"
+        "<!-- Made with Claude Sonnet --><!-- footer --></body></html>"
+    )
+    _c2, has_ai, findings, _ = inspect_html(html)
+    assert has_ai
+    assert sum(f.startswith("comment:") for f in findings) == 2
+    cleaned, actions = clean_html(html)
+    assert "ChatGPT" not in cleaned
+    assert "Claude" not in cleaned
+    assert "<!-- footer -->" in cleaned
+    assert "<p>Hi</p>" in cleaned
+    assert "drop AI provenance comment x2" in actions
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        "<!-- generated by Jekyll -->",
+        "<!-- START doctoc generated TOC please keep comment here -->",
+        "<!-- nav starts here -->",
+    ],
+)
+def test_html_non_ai_comments_kept(comment):
+    html = f"<html><body>{comment}<p>Hi</p></body></html>"
+    _c2, has_ai, _findings, _ = inspect_html(html)
+    assert not has_ai
+    cleaned, _actions = clean_html(html)
+    assert cleaned == html
+
+
+def test_html_c2pa_comment_sets_c2pa_flag():
+    has_c2pa, has_ai, _f, _ = inspect_html("<!-- C2PA manifest attached --><p>x</p>")
+    assert has_c2pa and has_ai
+
+
+def test_html_provenance_comment_unicode_offsets():
+    html = "<p>Café 🥋 naïve</p><!-- AI-generated with GPT-4o --><p>ünï 😀</p>"
+    cleaned, _actions = clean_html(html)
+    assert cleaned == "<p>Café 🥋 naïve</p><p>ünï 😀</p>"
+
+
+def test_markdown_provenance_comment_cleaned_outside_fences_only():
+    md = (
+        "# Title 🥋\n\n"
+        "<!-- written by Claude -->\n"
+        "Body.\n\n"
+        "```html\n<!-- generated by ChatGPT: example code -->\n```\n\n"
+        "~~~\n<!-- claude inside tilde fence -->\n~~~\n\n"
+        "<!-- TODO: add photo -->\n"
+    )
+    _c2, has_ai, findings, _ = inspect_markdown(md)
+    assert has_ai
+    assert sum(f.startswith("comment:") for f in findings) == 1
+    cleaned, actions = clean_markdown(md)
+    assert "written by Claude" not in cleaned
+    assert "<!-- generated by ChatGPT: example code -->" in cleaned
+    assert "<!-- claude inside tilde fence -->" in cleaned
+    assert "<!-- TODO: add photo -->" in cleaned
+    assert "drop AI provenance comment x1" in actions
+
+
+def test_markdown_unclosed_fence_is_left_alone():
+    md = "<!-- by Claude -->\n```\n<!-- by Claude -->\n"
+    cleaned, _actions = clean_markdown(md)
+    assert cleaned == "\n```\n<!-- by Claude -->\n"
+
+
+def test_markdown_fence_line_with_trailing_text_does_not_close():
+    md = "```\nx\n``` not a close\n<!-- by Claude -->\n```\n<!-- by Claude -->\n"
+    cleaned, _actions = clean_markdown(md)
+    assert cleaned == "```\nx\n``` not a close\n<!-- by Claude -->\n```\n\n"
+
+
+def test_markdown_backtick_info_string_with_backtick_is_not_a_fence():
+    md = "``` a`b\n<!-- by Claude -->\n"
+    cleaned, _actions = clean_markdown(md)
+    assert cleaned == "``` a`b\n\n"
+
+
+def test_markdown_frontmatter_and_comment_both_cleaned():
+    md = "---\ngenerator: ChatGPT\ntitle: Post\n---\n<!-- Gemini draft -->\nBody\n"
+    cleaned, _actions = clean_markdown(md)
+    assert "ChatGPT" not in cleaned
+    assert "Gemini" not in cleaned
+    assert "title: Post" in cleaned
+    assert "Body" in cleaned

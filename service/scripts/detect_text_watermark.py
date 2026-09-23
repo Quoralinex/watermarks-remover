@@ -24,11 +24,13 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import socket
 import socketserver
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -97,11 +99,15 @@ def _load_algorithm(
     offline: bool = False,
     temperature: float | None = None,
     top_p: float | None = None,
+    watermark_keys: list[int] | None = None,
 ):
     """Import the checkout and build an ``AutoWatermark`` instance.
 
     ``temperature``/``top_p`` (when not None) are folded into the generation
-    kwargs so callers can control sampling.
+    kwargs so callers can control sampling. ``watermark_keys`` (when not None)
+    overrides the algorithm's watermark keys in the config *before* the model
+    is constructed, so the logits processor bakes in the requested keys rather
+    than the config file's defaults.
     """
     gen_kwargs_extra: dict[str, float] = {}
     if temperature is not None:
@@ -137,11 +143,33 @@ def _load_algorithm(
         no_repeat_ngram_size=4,
         **gen_kwargs_extra,
     )
-    return AutoWatermark.load(
-        alg,
-        algorithm_config=str(config),
-        transformers_config=transformers_config,
-    )
+
+    # Apply the requested watermark keys before construction so the logits
+    # processor is built with them, instead of the config file's defaults.
+    tmp: str | None = None
+    if watermark_keys is not None:
+        data = json.loads(config.read_text("utf-8"))
+        data["keys"] = [int(k) for k in watermark_keys]
+        fd, tmp = tempfile.mkstemp(suffix=".json", prefix="watermarks-keys-", text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            config = Path(tmp)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    try:
+        return AutoWatermark.load(
+            alg,
+            algorithm_config=str(config),
+            transformers_config=transformers_config,
+        )
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def _threshold_from_config(config: Path) -> float | None:
@@ -157,7 +185,16 @@ def _threshold_from_config(config: Path) -> float | None:
 
 
 def _resolve_config(upstream: Path, alg: str, config: str | None) -> Path:
-    path = Path(config).expanduser().resolve() if config else upstream / "config" / f"{alg}.json"
+    config_dir = (upstream / "config").resolve()
+    if not config:
+        path = config_dir / f"{alg}.json"
+    else:
+        clean = os.path.basename(config.strip())
+        if clean != config.strip() or clean in ("..", ".", ""):
+            raise _Unavailable(f"MarkLLM config path traversal: {config}")
+        path = (config_dir / clean).resolve()
+        if not path.is_relative_to(config_dir):
+            raise _Unavailable(f"MarkLLM config path traversal: {config}")
     if not path.is_file():
         raise _Unavailable(f"MarkLLM config not found: {path}")
     try:
@@ -167,6 +204,24 @@ def _resolve_config(upstream: Path, alg: str, config: str | None) -> Path:
     if size > MAX_CONFIG_BYTES:
         raise _Unavailable(f"MarkLLM config too large ({size} bytes > {MAX_CONFIG_BYTES}): {path}")
     return path
+
+
+def _resolve_cli_config(upstream: Path, alg: str, config: str | None) -> Path:
+    """CLI-only resolver that also allows explicit external config filepaths."""
+    if config and (Path(config).is_file() or "/" in config or "\\" in config):
+        path = Path(config).expanduser().resolve()
+        if not path.is_file():
+            raise _Unavailable(f"MarkLLM config not found: {path}")
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            raise _Unavailable(f"cannot stat MarkLLM config {path}: {e}") from e
+        if size > MAX_CONFIG_BYTES:
+            raise _Unavailable(
+                f"MarkLLM config too large ({size} bytes > {MAX_CONFIG_BYTES}): {path}"
+            )
+        return path
+    return _resolve_config(upstream, alg, config)
 
 
 def _generate(
@@ -214,7 +269,7 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     device = resolve_device(args.device)
 
     try:
-        config = _resolve_config(upstream, alg, args.config)
+        config = _resolve_cli_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
         wm = _load_algorithm(
             upstream,
@@ -266,7 +321,7 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     device = resolve_device(args.device)
 
     try:
-        config = _resolve_config(upstream, alg, args.config)
+        config = _resolve_cli_config(upstream, alg, args.config)
         wm = _load_algorithm(
             upstream,
             alg,
@@ -387,7 +442,7 @@ def _cmd_serve(args: argparse.Namespace, upstream: Path, alg: str) -> int:
     """
     device = resolve_device(args.device)
     try:
-        config = _resolve_config(upstream, alg, args.config)
+        config = _resolve_cli_config(upstream, alg, args.config)
         threshold = _threshold_from_config(config)
         wm = _load_algorithm(
             upstream,
